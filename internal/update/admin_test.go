@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -76,12 +77,13 @@ func TestSwapScript(t *testing.T) {
 	if version(t, bundle) != "new" {
 		t.Error("the new app isn't in place")
 	}
-	if _, err := os.Stat(old); !os.IsNotExist(err) {
-		t.Error("the old app was left behind")
+	if version(t, old) != "old" {
+		t.Error("the running app was removed before it could relaunch")
 	}
 
 	// a failed second move puts the app back
 	os.RemoveAll(staged)
+	old = filepath.Join(dir, "another-old.app")
 	if exec.Command("/bin/sh", "-c", swapScript(staged, bundle, old)).Run() == nil {
 		t.Error("the swap succeeded without a staged app")
 	}
@@ -113,6 +115,83 @@ func TestAsAdmin(t *testing.T) {
 	out, err := exec.Command("osascript", "-e", `"`+appleString(script)+`"`).Output()
 	if err != nil || strings.TrimSuffix(string(out), "\n") != script {
 		t.Errorf("AppleScript read %q (%v), want %q", out, err, script)
+	}
+}
+
+// Exercise the whole InstallAsAdmin path, including its staging cleanup,
+// executing the actual script as this user. No password prompt is opened.
+func TestAdminInstallKeepsRunningBundleOutsideStage(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Mac app's administrator script")
+	}
+	wasRun := run
+	t.Cleanup(func() { run = wasRun })
+	run = func(name string, args ...string) ([]byte, error) {
+		if name != "osascript" || len(args) != 2 || args[0] != "-e" {
+			t.Fatalf("unexpected administrator invocation: %s %q", name, args)
+		}
+		literal := strings.TrimPrefix(args[1], "do shell script ")
+		literal = strings.TrimSuffix(literal, ` with prompt "magpie is updating itself." with administrator privileges`)
+		if !strings.HasPrefix(literal, `"`) || !strings.HasSuffix(literal, `"`) {
+			t.Fatal("expected an AppleScript string literal")
+		}
+		script, err := exec.Command("osascript", "-e", literal).Output()
+		if err != nil {
+			return nil, err
+		}
+		return exec.Command("/bin/sh", "-c", string(script)).CombinedOutput()
+	}
+	testInstallKeepsRunningBundle(t, InstallAsAdmin)
+	// The first move failing must not become success because a later
+	// housekeeping command succeeded.
+	dir := t.TempDir()
+	staged, bundle := filepath.Join(dir, "stage", "app", "magpie.app"), filepath.Join(dir, "missing.app")
+	app(t, staged, "new")
+	owner := exec.Command("/usr/bin/true")
+	if err := owner.Run(); err != nil {
+		t.Fatal(err)
+	}
+	stale := strings.Replace(retainedBundle(bundle), "previous-"+strconv.Itoa(os.Getpid())+"-", "previous-"+strconv.Itoa(owner.Process.Pid)+"-", 1)
+	app(t, stale, "unused")
+	mac := filepath.Join(stale, "Contents", "MacOS")
+	if err := os.MkdirAll(mac, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mac, "magpie"), []byte("unused image"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if len(unusedBundles(bundle)) != 1 {
+		t.Fatal("the fixture needs a stale copy awaiting housekeeping")
+	}
+	if err := InstallAsAdmin(staged, bundle); err == nil {
+		t.Fatal("an unsuccessful administrator swap reported success")
+	}
+	if version(t, staged) != "new" {
+		t.Fatal("an unsuccessful swap removed the download")
+	}
+	if version(t, stale) != "unused" {
+		t.Fatal("housekeeping ran after a failed swap")
+	}
+}
+
+func TestCanceledBundleInstallPreservesFiles(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Mac password prompt")
+	}
+	wasRun := run
+	t.Cleanup(func() { run = wasRun })
+	run = func(string, ...string) ([]byte, error) {
+		return []byte("User canceled. (-128)"), errors.New("exit status 1")
+	}
+	dir := t.TempDir()
+	staged, bundle := filepath.Join(dir, "stage", "app", "magpie.app"), filepath.Join(dir, "magpie.app")
+	app(t, staged, "new")
+	app(t, bundle, "running")
+	if err := InstallAsAdmin(staged, bundle); !errors.Is(err, ErrCanceled) {
+		t.Fatalf("dismissed password prompt: %v", err)
+	}
+	if version(t, staged) != "new" || version(t, bundle) != "running" {
+		t.Fatal("canceling the prompt changed the apps")
 	}
 }
 

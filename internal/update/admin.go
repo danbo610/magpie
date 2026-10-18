@@ -85,7 +85,7 @@ func asAdmin(script string) error {
 // bundle back if the second move fails.
 func swapScript(staged, bundle, old string) string {
 	s, b, o := shellQuote(staged), shellQuote(bundle), shellQuote(old)
-	return "rm -rf " + o + " && mv " + b + " " + o + " && if mv " + s + " " + b + "; then rm -rf " + o + "; else mv " + o + " " + b + "; exit 1; fi"
+	return "test ! -e " + o + " && mv " + b + " " + o + " && if mv " + s + " " + b + "; then :; else mv " + o + " " + b + "; exit 1; fi"
 }
 
 // shellQuote quotes s for /bin/sh.

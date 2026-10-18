@@ -7,6 +7,32 @@ with no binding generator and no bundler. `magpie web` serves the same page
 to a browser for a machine with no desktop. Package `internal/gui` hosts all
 three.
 
+## Updating and restarting
+
+The Mac updater installs the new `.app` before quitting. It retains the
+old bundle beside the installed app, under a unique hidden name outside
+the download staging directory: on macOS 13, deleting the running image
+can cause the system to kill a newly forked relaunch helper before it
+executes. The administrator-assisted swap keeps the same lifetime and
+restores the old app if installing the new one fails.
+
+`update.Relaunch` keeps the helper in its own session and waits for an
+acknowledgment from the shell before allowing the GUI to quit. A failed
+start or acknowledgment leaves the current app running and shows the
+error; Restart to update retries the handoff without reinstalling. The
+acknowledgment confirms the helper is running, not that the future `open`
+has succeeded. An ordinary quit still installs without reopening.
+
+`update.RemoveOldBundles`, called at startup and after an installation,
+only removes a retained copy after its updater has exited and macOS's
+`lsof` confirms no process uses its executable (including a separate CLI).
+Unknown process state or a cleanup failure keeps the copy for a later
+launch/update. Protected copies are also cleaned during the next
+administrator-assisted update, without a new startup password prompt.
+See [`internal/update/retain.go`](../../internal/update/retain.go),
+[`update.go`](../../internal/update/update.go) and
+[`internal/gui/update.go`](../../internal/gui/update.go).
+
 ## Responsibilities and sources of truth
 
 | Part | Responsibility | Source |

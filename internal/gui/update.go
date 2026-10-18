@@ -41,6 +41,9 @@ type updater struct {
 	mirror string      // error: the mirror the failed download came through (#893)
 	staged string
 	aside  string // Windows: where install moved the running exe, to put back
+
+	installed bool // the .app was swapped; a failed relaunch can be retried
+
 	// a version this computer wouldn't start (Smart App Control, #894),
 	// which the clock's checks don't download again; byClock, the check
 	// under way is the clock's
@@ -151,6 +154,7 @@ func (u *updater) place(goos string, gui bool) {
 	if b := bundleOf(); b != "" {
 		if u.stuck = update.Stuck(b); u.stuck == "" {
 			u.bundle = b
+			update.RemoveOldBundles(b)
 		}
 	} else if goos != "darwin" || !gui {
 		if exe, err := executable(); err == nil {
@@ -379,6 +383,7 @@ func (u *updater) install(ask bool) bool {
 		// in, and swapping this one's download in would move it aside (the
 		// download is left: it may be the other's, staged at the same name)
 		u.staged = ""
+		u.err = ""
 		return true
 	}
 	if u.staged == "" {
@@ -410,6 +415,7 @@ func (u *updater) install(ask bool) bool {
 		return false
 	}
 	u.staged = ""
+	u.installed = u.bundle != ""
 	return true
 }
 
@@ -436,10 +442,10 @@ func (u *updater) assetSize(rel *update.Release) int64 {
 	return rel.Assets[update.BinaryAsset()].Size
 }
 
-// replaced is whether the binary was updated by another magpie since this
-// one started, which runs on from where it was moved aside.
+// replaced says an installation is already in place: this process swapped
+// its bundle, or another magpie replaced its binary since it started.
 func (u *updater) replaced() bool {
-	return u.exe != "" && update.Replaced(u.exe, u.self)
+	return u.installed || u.exe != "" && update.Replaced(u.exe, u.self)
 }
 
 func (u *updater) json() updateJSON { return u.jsonIn("") }
@@ -613,8 +619,11 @@ func updateRoutes(mux *http.ServeMux, w Windows) {
 	})
 }
 
-// relaunchBinary is update.RelaunchBinary; tests stand in for it.
-var relaunchBinary = update.RelaunchBinary
+// Tests stand in for the two relaunch paths.
+var (
+	relaunchBinary = update.RelaunchBinary
+	relaunchBundle = update.Relaunch
+)
 
 // restartToUpdate installs the staged version and arranges for it to open
 // once this process is gone; the caller then quits. magpie web runs on as
@@ -646,7 +655,7 @@ func restartInto(web, window bool, view string, bySelf bool) bool {
 	}
 	var err error
 	if bundle != "" {
-		err = update.Relaunch(bundle, window || !bySelf)
+		err = relaunchBundle(bundle, window || !bySelf)
 	} else {
 		updates.mu.Lock()
 		aside := updates.aside
@@ -664,6 +673,11 @@ func restartInto(web, window bool, view string, bySelf bool) bool {
 	}
 	if err != nil {
 		log.Println("update:", err)
+		os.Remove(filepath.Join(settings.Dir(), updatedInAppFile))
+		updates.mu.Lock()
+		updates.state, updates.err = "ready", err.Error()
+		updates.mu.Unlock()
+		return false
 	}
 	return true
 }

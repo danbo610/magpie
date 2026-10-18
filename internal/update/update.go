@@ -324,24 +324,32 @@ func stageDir(dir string) string {
 // magpie's to change the error is a permission one (NeedsAdmin), and
 // InstallAsAdmin can do it instead.
 func Install(staged, bundle string) error {
-	old := filepath.Join(filepath.Dir(staged), "old.app")
-	os.RemoveAll(old)
+	old := retainedBundle(bundle)
 	if err := os.Rename(bundle, old); err != nil {
 		return err
 	}
 	if err := os.Rename(staged, bundle); err != nil {
-		os.Rename(old, bundle) // put it back
+		if restoreErr := os.Rename(old, bundle); restoreErr != nil {
+			return errors.Join(err, fmt.Errorf("couldn't restore %s from %s: %w", bundle, old, restoreErr))
+		}
 		return err
 	}
 	os.RemoveAll(filepath.Dir(filepath.Dir(staged))) // .magpie-update
+	RemoveOldBundles(bundle)
 	return nil
 }
 
 // InstallAsAdmin is Install with the administrator's password, asked for
 // by the system.
 func InstallAsAdmin(staged, bundle string) error {
-	old := filepath.Join(filepath.Dir(staged), "old.app")
-	err := asAdmin(swapScript(staged, bundle, old))
+	old := retainedBundle(bundle)
+	script := swapScript(staged, bundle, old) + " || exit $?"
+	// A protected Applications folder may need this same authorization to
+	// remove earlier copies. Never prompt just to clean up at startup.
+	for _, stale := range unusedBundles(bundle) {
+		script += "; rm -rf " + shellQuote(stale) + " || true"
+	}
+	err := asAdmin(script)
 	if err == nil {
 		os.RemoveAll(filepath.Dir(filepath.Dir(staged)))
 	}
@@ -363,11 +371,42 @@ func Relaunch(bundle string, window bool) error {
 // 13 at least, the job LaunchServices runs an app in when it is opened from
 // the Dock or Finder, which magpie can't set that key on (#2362).
 func runAfterExit(pid int, command string) error {
-	script := fmt.Sprintf(`while kill -0 %d 2>/dev/null; do sleep 0.2; done; %s`, pid, command)
-	cmd := proc.Command("/bin/sh", "-c", script)
+	return afterExitShell(pid, command, "/bin/sh")
+}
+
+// Wait for the shell itself: Start can succeed even when macOS kills the
+// forked child before exec because its parent's old image was deleted.
+func afterExitShell(pid int, command, shell string) error {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	defer w.Close()
+	script := fmt.Sprintf(`printf . >&3 || exit 1; exec 3>&-; while kill -0 %d 2>/dev/null; do sleep 0.2; done; %s`, pid, command)
+	cmd := proc.Command(shell, "-c", script)
+	cmd.ExtraFiles = []*os.File{w}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	detach(cmd)
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	w.Close()
+	err = r.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if err == nil {
+		var ready [1]byte
+		_, err = io.ReadFull(r, ready[:])
+		if err == nil && ready[0] != '.' {
+			err = errors.New("invalid relaunch helper acknowledgment")
+		}
+	}
+	if err != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+		return fmt.Errorf("the relaunch helper did not become ready: %w", err)
+	}
+	// This helper waits for us to exit, so launchd will adopt and reap it.
+	return cmd.Process.Release()
 }
 
 // relaunchOpen is the open command Relaunch runs for bundle.
